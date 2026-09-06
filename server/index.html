@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Session Auth Lab</title>
+</head>
+<body>
+
+<h1>Session Auth Lab</h1>
+
+<input id="username" value="alice">
+<input id="password" type="password" value="secret123">
+
+<button onclick="login()">Login</button>
+<button onclick="profile()">Profile</button>
+<button onclick="logout()">Logout</button>
+
+<pre id="output"></pre>
+
+<script>
+async function login() {
+    const response = await fetch("/login", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+            username: document.getElementById("username").value,
+            password: document.getElementById("password").value
+        })
+    });
+
+    document.getElementById("output").textContent =
+        await response.text();
+}
+
+async function profile() {
+    const response = await fetch("/profile");
+
+    document.getElementById("output").textContent =
+        await response.text();
+}
+
+async function logout() {
+    const response = await fetch("/logout", {
+        method: "POST"
+    });
+
+    document.getElementById("output").textContent =
+        await response.text();
+}
+</script>
+
+</body>
+</html>
