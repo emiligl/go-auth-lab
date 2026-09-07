@@ -5,6 +5,8 @@ import (
 	"log"
 	"net/http"
 	"fmt"
+	"github.com/golang-jwt/jwt/v5"
+	"strings"
 )
 
 type LoginRequest struct {
@@ -47,33 +49,66 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func profileHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	cookie, err := r.Cookie("sid")
-	if err != nil {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	authHeader := r.Header.Get("Authorization")
+
+	if authHeader == "" {
+		http.Error(w, "Missing Authorization header", http.StatusUnauthorized)
 		return
 	}
 
-	user, exists := getRedisSession(cookie.Value)
-	if !exists {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	const prefix = "Bearer "
+
+	if !strings.HasPrefix(authHeader, prefix) {
+		http.Error(w, "Invalid Authorization header", http.StatusUnauthorized)
 		return
+	}
+
+	tokenString := strings.TrimPrefix(authHeader, prefix)
+
+	token, err := VerifyJWT(tokenString)
+	if err != nil {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	fmt.Println("JWT valid:", token.Valid)
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		http.Error(w, "Invalid claims", http.StatusUnauthorized)
+		return
+	}
+
+	userID := claims["user_id"]
+	role := claims["role"]
+
+	fmt.Println("User ID:", userID)
+	fmt.Println("Role:", role)
+
+	user, exists := users[userID]
+	
+	if !exists { 
+		http.Error(w, "Invalid userID", http.StatusUnauthorized) 
+		return 
 	}
 
 	response := map[string]string{
-		"id":       user.ID,
-		"username": user.Username,
-		"role":     user.Role,
-	}
+             	"id":	    user.ID,
+               	"username": user.Username,
+                "role":     user.Role,
+        }
 
-	json.NewEncoder(w).Encode(response)
+        json.NewEncoder(w).Encode(response)
+
 }
+
+
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -113,25 +148,16 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	sessionID, err := createRedisSession(user)
+	// Create JWT.
+	tokenString, err := CreateJWT(user)
 	if err != nil {
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		http.Error(w, "Error creating token", http.StatusInternalServerError)
 		return
 	}
-	
-	//sessionID := createMemorySession(user)
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     "sid",
-		Value:    sessionID,
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-		Path:     "/",
-	})
 
 	response := map[string]string{
-		"message": "login ok",
+		"token": tokenString,
 	}
 
 	json.NewEncoder(w).Encode(response)
@@ -139,6 +165,29 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "server/index.html")
+}
+
+func jwtTestHandler(w http.ResponseWriter, r *http.Request) {
+	user := User{
+		ID:   "alice",
+		Role: "user",
+	}
+
+	tokenString, err := CreateJWT(user)
+	if err != nil {
+		http.Error(w, "error creating token", http.StatusInternalServerError)
+		return
+	}
+
+	token, err := VerifyJWT(tokenString)
+	if err != nil {
+		http.Error(w, "invalid token: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	fmt.Fprintf(w, "JWT válido\n")
+	fmt.Fprintf(w, "Token: %s\n", tokenString)
+	fmt.Fprintf(w, "Valid: %v\n", token.Valid)
 }
 
 func main() {
@@ -167,6 +216,7 @@ func main() {
 	http.HandleFunc("/profile", profileHandler)
 	http.HandleFunc("/", indexHandler)
 	http.HandleFunc("/logout", logoutHandler)
+	http.HandleFunc("/jwt-test", jwtTestHandler)
 
 	log.Println("Server listening on :8080")
 
