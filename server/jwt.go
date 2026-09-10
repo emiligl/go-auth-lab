@@ -4,17 +4,21 @@ import (
 	"time"
 	"fmt"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 var jwtSecret = []byte("super-secret-key")
 
 func CreateJWT(user User) (string, error) {
 
+	jti := uuid.New().String()
+
 	claims := jwt.MapClaims{
-		"user_id": user.ID,
+		"user_id":  user.ID,
 		"user_name":user.Username,
-		"role":    user.Role,
-		"exp":     time.Now().Add(15 * time.Minute).Unix(),
+		"role":     user.Role,
+		"exp": 	    time.Now().Add(10 * time.Minute).Unix(),
+		"jti":	    jti,
 	}
 
 	token := jwt.NewWithClaims(
@@ -27,14 +31,14 @@ func CreateJWT(user User) (string, error) {
 
 func getSigningKey(token *jwt.Token) (interface{}, error) {
 
-	fmt.Printf("TOKEN: %+v\n", token)
+/*	fmt.Printf("TOKEN: %+v\n", token)
 
 	fmt.Printf("METHOD: %+v\n", token.Method)
 	fmt.Printf("HEADER: %+v\n", token.Header)
 	fmt.Printf("CLAIMS: %+v\n", token.Claims)
 	fmt.Printf("SIGNATURE: %+v\n", token.Signature)
 	fmt.Printf("VALID: %+v\n", token.Valid)
-
+*/
 	method := token.Method
 	expectedMethod := jwt.SigningMethodHS256
 

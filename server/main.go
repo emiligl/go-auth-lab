@@ -1,19 +1,20 @@
 package main
 
 import (
+	"context"
+	"time"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
-	"fmt"
 	"github.com/golang-jwt/jwt/v5"
-	"strings"
+	"github.com/redis/go-redis/v9"
 )
 
 type LoginRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 }
-
 
 type User struct {
 	ID           string `json:"id"`
@@ -22,177 +23,35 @@ type User struct {
 	PasswordHash string `json:"-"`
 }
 
-
 var users map[string]User
 
+type contextKey string
 
-func logoutHandler(w http.ResponseWriter, r *http.Request) {
-	cookie, err := r.Cookie("sid")
-	if err == nil {
-		// Eliminar la sesión de Redis
-		rdb.Del(ctx, "sess:"+cookie.Value)
-	}
+const (
+	userNameKey contextKey = "userName"
+	jtiKey      contextKey = "jti"
+	expKey      contextKey = "exp"
+)
 
-	// Eliminar la cookie del navegador
-	http.SetCookie(w, &http.Cookie{
-		Name:     "sid",
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-		Secure:   false,
-		SameSite: http.SameSiteLaxMode,
-	})
-
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("logout ok"))
-}
-
-func profileHandler(w http.ResponseWriter, r *http.Request) {
-
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	authHeader := r.Header.Get("Authorization")
-
-	if authHeader == "" {
-		http.Error(w, "Missing Authorization header", http.StatusUnauthorized)
-		return
-	}
-
-	const prefix = "Bearer "
-
-	if !strings.HasPrefix(authHeader, prefix) {
-		http.Error(w, "Invalid Authorization header", http.StatusUnauthorized)
-		return
-	}
-
-	tokenString := strings.TrimPrefix(authHeader, prefix)
-
-	token, err := VerifyJWT(tokenString)
-	if err != nil {
-		http.Error(w, "Invalid token", http.StatusUnauthorized)
-		return
-	}
-
-	fmt.Println("JWT valid:", token.Valid)
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		http.Error(w, "Invalid claims", http.StatusUnauthorized)
-		return
-	}
-
-	userID := claims["user_id"]
-	role := claims["role"]
-
-	fmt.Println("User ID:", userID)
-	fmt.Println("Role:", role)
-
-	user, exists := users[userID]
-	
-	if !exists { 
-		http.Error(w, "Invalid userID", http.StatusUnauthorized) 
-		return 
-	}
-
-	response := map[string]string{
-             	"id":	    user.ID,
-               	"username": user.Username,
-                "role":     user.Role,
-        }
-
-        json.NewEncoder(w).Encode(response)
-
-}
-
-
-
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Printf("Method: %s\n", r.Method)
-	fmt.Printf("URL: %s\n", r.URL)
-	fmt.Printf("Headers: %v\n", r.Header)
-	response := map[string]string{
-		"status": "ok",
-	}
-
-	json.NewEncoder(w).Encode(response)
-}
-
-func loginHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	// Only POST is allowed
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Decode JSON request body
-	var login LoginRequest
-
-	if err := json.NewDecoder(r.Body).Decode(&login); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	// Temporary hardcoded credentials.
-	// We will replace this later with proper authentication.
-	user, exists := users[login.Username]
-
-	if !exists || !CheckPassword(user.PasswordHash, login.Password) {
-		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
-		return
-	}
-	
-	// Create JWT.
-	tokenString, err := CreateJWT(user)
-	if err != nil {
-		http.Error(w, "Error creating token", http.StatusInternalServerError)
-		return
-	}
-
-
-	response := map[string]string{
-		"token": tokenString,
-	}
-
-	json.NewEncoder(w).Encode(response)
-}
-
-func indexHandler(w http.ResponseWriter, r *http.Request) {
-	http.ServeFile(w, r, "server/index.html")
-}
-
-func jwtTestHandler(w http.ResponseWriter, r *http.Request) {
-	user := User{
-		ID:   "alice",
-		Role: "user",
-	}
-
-	tokenString, err := CreateJWT(user)
-	if err != nil {
-		http.Error(w, "error creating token", http.StatusInternalServerError)
-		return
-	}
-
-	token, err := VerifyJWT(tokenString)
-	if err != nil {
-		http.Error(w, "invalid token: "+err.Error(), http.StatusUnauthorized)
-		return
-	}
-
-	fmt.Fprintf(w, "JWT válido\n")
-	fmt.Fprintf(w, "Token: %s\n", tokenString)
-	fmt.Fprintf(w, "Valid: %v\n", token.Valid)
-}
+var redisClient = redis.NewClient(&redis.Options{
+	Addr: "localhost:6379",
+})
 
 func main() {
-	hash, err := HashPassword("secret123")
 	
+	ctx := context.Background()
+
+	_, err := redisClient.Ping(ctx).Result()
+
+	if err != nil {
+		fmt.Println("Redis connection error:", err)
+		return
+	}
+
+	fmt.Println("Redis connected")
+
+	hash, err := HashPassword("secret123")
+
 	if err != nil {
     		log.Fatal(err)
 	}
@@ -211,16 +70,256 @@ func main() {
 		},
 	}
 
-	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/login", loginHandler)	
-	http.HandleFunc("/profile", profileHandler)
+
+	http.Handle(
+		"/profile",
+		jwtMiddleware(http.HandlerFunc(profileHandler)),
+	)
+
+	http.Handle(
+		"/logout",
+		jwtMiddleware(http.HandlerFunc(logoutHandler)),
+	)
+
 	http.HandleFunc("/", indexHandler)
-	http.HandleFunc("/logout", logoutHandler)
-	http.HandleFunc("/jwt-test", jwtTestHandler)
 
 	log.Println("Server listening on :8080")
 
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal(err)
 	}
+
+}
+
+func indexHandler(w http.ResponseWriter, r *http.Request) {
+	http.ServeFile(w, r, "server/index.html")
+}
+
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var login LoginRequest
+
+	err := json.NewDecoder(r.Body).Decode(&login)
+
+	if err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	user, exists := users[login.Username]
+
+	if !exists || !CheckPassword(user.PasswordHash, login.Password) {
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	tokenString, err := CreateJWT(user)
+
+	if err != nil {
+		http.Error(w, "Error creating token", http.StatusInternalServerError)
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "access_token",
+		Value:    tokenString,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   false,
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+
+	response := map[string]string{
+		"message": "Login successful",
+	}
+
+	json.NewEncoder(w).Encode(response)
+}
+
+func jwtMiddleware(next http.Handler) http.Handler {
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		cookie, err := r.Cookie("access_token")
+
+		if err != nil {
+			http.Error(w, "Missing access token", http.StatusUnauthorized)
+			return
+		}
+
+		tokenString := cookie.Value
+
+		token, err := VerifyJWT(tokenString)
+
+		if err != nil {
+			http.Error(w, "Invalid token", http.StatusUnauthorized)
+			return
+		}
+
+		if !token.Valid {
+			http.Error(w, "Invalid token", http.StatusUnauthorized)
+			return
+		}
+
+		claims, ok := token.Claims.(jwt.MapClaims)
+
+		if !ok {
+			http.Error(w, "Invalid claims", http.StatusUnauthorized)
+			return
+		}
+
+		userName, ok := claims["user_name"].(string)
+
+		if !ok {
+			http.Error(w, "Invalid username", http.StatusUnauthorized)
+			return
+		}
+		
+		jti, ok := claims["jti"].(string)
+
+		if !ok {
+			http.Error(w, "Invalid token ID", http.StatusUnauthorized)
+			return
+		}
+
+		exp, ok := claims["exp"].(float64)
+
+		if !ok {
+			http.Error(w, "Invalid expiration", http.StatusUnauthorized)
+			return
+		}
+
+
+		expiresAt := time.Unix(int64(exp), 0)
+
+
+		revoked, err := redisClient.Exists(
+			context.Background(),
+			"revoked:"+jti,
+		).Result()
+
+		if err != nil {
+			http.Error(w, "Redis error", http.StatusInternalServerError)
+			return
+		}
+
+		if revoked > 0 {
+			http.Error(w, "Token revoked", http.StatusUnauthorized)
+			return
+		}
+
+
+		ctx := context.WithValue(
+			r.Context(),
+			userNameKey,
+			userName,
+		)
+
+		ctx = context.WithValue(
+			ctx,
+			jtiKey,
+			jti,
+		)
+
+		ctx = context.WithValue(
+			ctx,
+			expKey,
+			expiresAt,
+		)
+
+		r = r.WithContext(ctx)
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func profileHandler(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userName, ok := r.Context().Value(userNameKey).(string)
+
+	if !ok {
+		http.Error(w, "User not found in context", http.StatusUnauthorized)
+		return
+	}
+
+	user, exists := users[userName]
+
+	if !exists {
+		http.Error(w, "User not found", http.StatusUnauthorized)
+		return
+	}
+
+	response := map[string]string{
+		"id":       user.ID,
+		"username": user.Username,
+		"role":     user.Role,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	json.NewEncoder(w).Encode(response)
+}
+	
+func logoutHandler(w http.ResponseWriter, r *http.Request) {
+
+	jti, ok := r.Context().Value(jtiKey).(string)
+
+	if !ok {
+		http.Error(w, "JTI not found", http.StatusUnauthorized)
+		return
+	}
+
+	expiresAt, ok := r.Context().Value(expKey).(time.Time)
+
+	if !ok {
+		http.Error(w, "Expiration not found", http.StatusUnauthorized)
+		return
+	}
+
+	ttl := time.Until(expiresAt)
+
+	if ttl <= 0 {
+		http.Error(w, "Token already expired", http.StatusUnauthorized)
+		return
+	}
+
+	ctx := context.Background()
+
+	err := redisClient.Set(
+		ctx,
+		"revoked:"+jti,
+		"true",
+		ttl,
+	).Err()
+
+	if err != nil {
+		http.Error(w, "Redis error", http.StatusInternalServerError)
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "access_token",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   false,
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("logout ok"))
 }
