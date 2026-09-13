@@ -1,817 +1,454 @@
 # Go Authentication Lab
 
-Hands-on authentication lab built in Go to understand how authentication works at HTTP, application and storage level.
+A hands-on authentication lab built in Go to understand authentication at the HTTP, application, and storage levels.
 
-The lab starts with password hashing and stateful session-based authentication, using both in-memory storage and Redis. The same authentication flow is exercised from a Go HTTP client and from a browser.
+The project is intentionally developed through **two Git branches**, each representing a different authentication model:
 
-JWT authentication will be implemented as the next stage of the lab, using the same client/server structure to compare both approaches.
+- `main` → traditional **stateful session-based authentication**
+- `jwt` → **JWT-based authentication with HttpOnly cookies, Redis revocation, and refresh-token rotation**
 
----
-
-## 🎯 Goals
-
-The objective of this lab is not only to implement authentication, but to understand what happens between client and server.
-
-Topics covered:
-
-- HTTP client/server communication
-- HTTP handlers and requests/responses
-- Password hashing with bcrypt
-- Salt and password verification
-- Session IDs
-- Stateful authentication
-- Server-side session storage
-- In-memory sessions
-- Redis-backed sessions
-- Session TTL
-- HTTP cookies
-- `HttpOnly`
-- `Secure`
-- `SameSite`
-- Browser authentication
-- Go HTTP client with `CookieJar`
-- Login / authenticated requests / logout
-- Redis inspection using `redis-cli`
-- Difference between cookies, `localStorage` and `sessionStorage`
+The goal is to understand the mechanics behind each approach and compare their trade-offs.
 
 ---
 
-# Architecture
+## Branches
 
-The lab deliberately separates the client from the server.
+### `main` — Stateful Session Authentication
 
-```text
-                 ┌─────────────────┐
-                 │   Go Client     │
-                 │                 │
-                 │   HTTP Client   │
-                 │   CookieJar     │
-                 └────────┬────────┘
-                          │
-                          │ HTTP
-                          ▼
-                 ┌─────────────────┐
-                 │   Go Server     │
-                 │                 │
-                 │   /health       │
-                 │   /login        │
-                 │   /profile      │
-                 │   /logout       │
-                 └────────┬────────┘
-                          │
-                          │ session
-                          ▼
-                 ┌─────────────────┐
-                 │      Redis      │
-                 │                 │
-                 │ sess:<id>       │
-                 │ TTL: 15 min     │
-                 └─────────────────┘
-```
+The `main` branch implements classic server-side session authentication.
 
-The browser is also used as a real HTTP client:
+The browser receives an opaque session ID in an HttpOnly cookie:
 
 ```text
 Browser
    │
-   │ POST /login
-   ▼
-Go Server
-   │
-   ▼
-Redis
-   │
-   ▼
-Set-Cookie: sid=<session-id>
-   │
-   ▼
-Browser
-   │
-   │ GET /profile
    │ Cookie: sid=<session-id>
    ▼
 Go Server
    │
    ▼
 Redis
+   │
+   ▼
+User / Session
+```
+
+The actual authentication state lives on the server.
+
+Topics covered:
+
+- HTTP client/server communication
+- Go `net/http`
+- HTTP handlers
+- Password hashing with bcrypt
+- Password verification
+- Random session IDs
+- Stateful authentication
+- In-memory sessions
+- Redis-backed sessions
+- Redis session TTL
+- HTTP cookies
+- `HttpOnly`
+- `Secure`
+- `SameSite`
+- Browser authentication
+- Go `CookieJar`
+- Authenticated requests
+- Logout
+- Redis inspection
+
+Authentication flow:
+
+```text
+POST /login
+     │
+     ▼
+username + password
+     │
+     ▼
+bcrypt verification
+     │
+     ▼
+generate session ID
+     │
+     ▼
+store session in Redis
+     │
+     ▼
+Set-Cookie: sid=<session-id>
+     │
+     ▼
+GET /profile
+     │
+     ▼
+Redis lookup
+     │
+     ▼
+authenticated user
+```
+
+Logout invalidates the server-side session immediately by removing it from Redis and expiring the browser cookie.
+
+---
+
+### `jwt` — JWT Authentication
+
+The `jwt` branch replaces the traditional session cookie with a JWT-based authentication flow.
+
+The current architecture uses **HttpOnly cookies**, not `localStorage`.
+
+```text
+Browser
+   │
+   │ Cookie: access_token=<JWT>
+   ▼
+Go Server
+   │
+   ├── Verify JWT
+   ├── Validate signature
+   ├── Validate expiration
+   ├── Read claims
+   └── Check Redis revocation
+```
+
+#### Access Token
+
+The access token is a signed JWT containing:
+
+```text
+user_id
+user_name
+role
+exp
+jti
+```
+
+The `jti` uniquely identifies each access token.
+
+The `exp` claim controls JWT expiration.
+
+#### JWT Middleware
+
+Protected endpoints use middleware so authentication logic is not duplicated in every handler.
+
+The middleware:
+
+1. Reads the `access_token` cookie.
+2. Verifies the JWT.
+3. Validates the token and its claims.
+4. Extracts the username, `jti`, and expiration.
+5. Checks Redis for token revocation.
+6. Stores request-scoped authentication data in `context`.
+7. Calls the next handler.
+
+Conceptually:
+
+```text
+Request
+   │
+   ▼
+access_token cookie
+   │
+   ▼
+JWT middleware
+   │
+   ├── VerifyJWT()
+   ├── Validate claims
+   ├── Check Redis
+   │      │
+   │      └── revoked:<jti>
+   │
+   ▼
+request context
+   │
+   ▼
+profileHandler / logoutHandler / ...
+```
+
+#### Redis Revocation
+
+JWTs are normally stateless, but this lab adds server-side revocation using Redis.
+
+When the user logs out, the JWT's `jti` is stored as:
+
+```text
+revoked:<jti>
+```
+
+The Redis key receives a TTL based on the JWT's remaining lifetime.
+
+Therefore:
+
+- revocation is immediate
+- the JWT itself does not need to be deleted
+- Redis does not store every active JWT
+- the revocation entry disappears automatically when the JWT would have expired
+
+---
+
+## Refresh Tokens
+
+The `jwt` branch also implements refresh tokens.
+
+The refresh token is an opaque, cryptographically random value rather than a JWT.
+
+It is stored in an HttpOnly cookie:
+
+```text
+Cookie: refresh_token=<opaque-token>
+```
+
+Refresh tokens are stored server-side in Redis.
+
+A refresh-token record contains:
+
+```text
+refresh:<token>
+    ├── username
+    └── session_id
+```
+
+The Redis key has a TTL representing the refresh-token lifetime.
+
+---
+
+## Refresh Token Rotation
+
+Every successful refresh consumes the current refresh token and creates a new one.
+
+```text
+refresh A
+    │
+    │ /refresh
+    ▼
+used_refresh:A
+    │
+    ▼
+refresh B
+```
+
+The new refresh token keeps the same `session_id` and inherits the remaining TTL.
+
+This makes each refresh token effectively single-use.
+
+---
+
+## Refresh Token Reuse Detection
+
+The lab also implements reuse detection.
+
+If an already-used refresh token is presented again:
+
+```text
+refresh A
+    │
+    ▼
+refresh:A does not exist
+    │
+    ▼
+used_refresh:A exists
+    │
+    ▼
+REUSE DETECTED
+    │
+    ▼
+session:<session-id> = revoked
+```
+
+The whole refresh-token family/session is then considered compromised and revoked.
+
+A newer refresh token belonging to the same session will subsequently fail with:
+
+```text
+Session revoked
+```
+
+This demonstrates how refresh-token rotation can detect reuse of an old token and revoke the associated token family.
+
+---
+
+## JWT Branch Authentication Flow
+
+The complete flow is:
+
+```text
+                    LOGIN
+                      │
+                      ▼
+               username/password
+                      │
+                      ▼
+               CheckPassword()
+                      │
+                      ▼
+             ┌────────┴────────┐
+             │                 │
+             ▼                 ▼
+        Access JWT        Refresh Token
+          + jti                 │
+             │                  ▼
+             │              Redis
+             │          refresh:<token>
+             │                  │
+             ▼                  ▼
+       HttpOnly cookie      session_id
+             │
+             └────────┬─────────┘
+                      │
+                      ▼
+               Authenticated
+                 requests
+                      │
+                      ▼
+               JWT middleware
+                      │
+             ┌────────┴────────┐
+             │                 │
+             ▼                 ▼
+        Verify JWT        Redis check
+             │                 │
+             │          revoked:<jti>
+             │
+             ▼
+          context
+             │
+             ▼
+         /profile
+```
+
+When the access token expires:
+
+```text
+Browser
+   │
+   │ refresh_token cookie
+   ▼
+POST /refresh
+   │
+   ▼
+Redis validation
+   │
+   ▼
+Rotate refresh token
+   │
+   ├── old → used_refresh
+   └── new → refresh:<token>
+   │
+   ▼
+Create new access JWT
+   │
+   ▼
+Set new HttpOnly cookies
 ```
 
 ---
 
-# Project Structure
+## Comparing the Two Branches
+
+| Feature | `main` | `jwt` |
+|---|---|---|
+| Authentication model | Stateful session | JWT + refresh tokens |
+| Access credential | Session ID | Signed JWT |
+| Browser storage | HttpOnly cookie | HttpOnly cookies |
+| Server-side session state | Yes | Limited to security state |
+| Redis sessions | Yes | Refresh/revocation state |
+| JWT | No | Yes |
+| JWT claims | No | Yes |
+| JWT `jti` | No | Yes |
+| JWT expiration | Session TTL | JWT `exp` |
+| Immediate access-token revocation | Delete session | Redis `revoked:<jti>` |
+| Refresh token | No | Yes |
+| Refresh-token rotation | No | Yes |
+| Refresh-token reuse detection | No | Yes |
+| Session/token-family revocation | No | Yes |
+| Password hashing | bcrypt | bcrypt |
+| Browser authentication | Yes | Yes |
+
+---
+
+## Security Concepts Demonstrated
+
+### Password Security
+
+Passwords are never stored in plaintext. Bcrypt is used for password hashing and verification.
+
+### HttpOnly Cookies
+
+Authentication cookies use:
+
+```go
+HttpOnly: true
+```
+
+This prevents JavaScript from directly reading the authentication cookies.
+
+### Secure Cookies
+
+Local development uses:
+
+```go
+Secure: false
+```
+
+because the lab runs over HTTP.
+
+Production authentication should use HTTPS with:
+
+```go
+Secure: true
+```
+
+### SameSite
+
+The cookies use:
+
+```go
+SameSite: http.SameSiteLaxMode
+```
+
+to provide additional protection against cross-site request scenarios.
+
+### Redis TTL
+
+Redis TTLs automatically remove temporary authentication state.
+
+### Token Revocation
+
+The JWT branch demonstrates how an otherwise stateless JWT system can gain immediate server-side revocation.
+
+### Refresh Token Rotation
+
+Each refresh token is consumed and replaced by a new token.
+
+### Refresh Token Reuse Detection
+
+Reuse of an old refresh token revokes the associated session/token family.
+
+---
+
+## Project Structure
+
+The exact files may evolve as the lab progresses. The JWT branch currently revolves around the Go server, JWT/authentication code, and browser client.
+
+Typical structure:
 
 ```text
 .
 ├── go.mod
 ├── go.sum
 │
-├── server/
-│   ├── main.go
-│   ├── auth.go
-│   ├── session_memory.go
-│   ├── session_redis.go
-│   └── index.html
-│
-└── client/
-    └── main.go
-```
-
-The project intentionally keeps the memory and Redis implementations separately so they can be compared.
-
----
-
-# 1. HTTP Server
-
-The server exposes several endpoints:
-
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| GET | `/health` | Health check |
-| POST | `/login` | Authenticate user and create session |
-| GET | `/profile` | Access authenticated user |
-| POST | `/logout` | Invalidate session |
-| GET | `/` | Browser client |
-
-The handlers use the standard Go `net/http` package.
-
-Example:
-
-```go
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-    w.WriteHeader(http.StatusOK)
-    w.Write([]byte(`{"status":"ok"}`))
-}
-```
-
-The handler receives:
-
-```go
-func handler(w http.ResponseWriter, r *http.Request)
-```
-
-where:
-
-- `w` is the HTTP response writer
-- `r` contains the incoming HTTP request
-
----
-
-# 2. Password Hashing
-
-Passwords are never stored as plaintext.
-
-The lab uses bcrypt:
-
-```go
-func HashPassword(pw string) (string, error) {
-    b, err := bcrypt.GenerateFromPassword(
-        []byte(pw),
-        bcrypt.DefaultCost,
-    )
-
-    return string(b), err
-}
-```
-
-Password verification is performed with:
-
-```go
-func CheckPassword(hash, pw string) bool {
-    return bcrypt.CompareHashAndPassword(
-        []byte(hash),
-        []byte(pw),
-    ) == nil
-}
-```
-
-## Important concepts
-
-Bcrypt:
-
-- generates a random salt
-- includes the salt in the resulting hash
-- stores the cost factor in the hash
-- is deliberately expensive to compute
-- does not allow recovering the original password
-
-The stored value contains enough information to verify the password, but it is not the original password.
-
-Conceptually:
-
-```text
-password
-    │
-    ▼
-bcrypt
-    │
-    ├── salt
-    ├── cost
-    └── derived hash
-    │
-    ▼
-stored hash
-```
-
-When the user logs in:
-
-```text
-password supplied
-       │
-       ▼
-CompareHashAndPassword
-       │
-       ▼
-stored bcrypt hash
-       │
-       ▼
-match / reject
+└── server/
+    ├── main.go
+    ├── jwt.go
+    ├── auth.go
+    └── index.html
 ```
 
 ---
 
-# 3. Session Authentication
+## Running the Lab
 
-After successful authentication, the server creates a random session ID.
-
-```go
-func newSessionID() string {
-    b := make([]byte, 32)
-
-    if _, err := rand.Read(b); err != nil {
-        panic(err)
-    }
-
-    return hex.EncodeToString(b)
-}
-```
-
-The session ID is not the user's identity itself.
-
-It is an opaque identifier:
-
-```text
-session ID
-    │
-    ▼
-server-side session
-    │
-    ▼
-user
-```
-
----
-
-# 4. In-Memory Sessions
-
-The first implementation stores sessions directly inside the Go process:
-
-```go
-var sessions = make(map[string]User)
-```
-
-Conceptually:
-
-```text
-sid=ABC123
-    │
-    ▼
-Go process memory
-    │
-    ▼
-User Alice
-```
-
-This is simple and useful for understanding stateful authentication.
-
-However, the data disappears when the process stops.
-
-It also becomes problematic with multiple server instances:
-
-```text
-             Load Balancer
-              /          \
-             ▼            ▼
-        Server A       Server B
-        memory A       memory B
-```
-
-A session created on Server A does not automatically exist on Server B.
-
----
-
-# 5. Redis Sessions
-
-The second implementation stores sessions in Redis.
-
-```go
-err = rdb.Set(
-    ctx,
-    "sess:"+sessionID,
-    data,
-    15*time.Minute,
-).Err()
-```
-
-The session is stored as:
-
-```text
-sess:<session-id>
-```
-
-Example:
-
-```text
-sess:8f7c2e...
-```
-
-with a TTL of 15 minutes.
-
-Retrieving the session:
-
-```go
-data, err := rdb.Get(
-    ctx,
-    "sess:"+sessionID,
-).Result()
-```
-
-The flow becomes:
-
-```text
-Cookie
-  │
-  ▼
-session ID
-  │
-  ▼
-Redis GET
-  │
-  ▼
-JSON
-  │
-  ▼
-User
-```
-
-Redis allows multiple application instances to share the same session store:
-
-```text
-             Load Balancer
-              /          \
-             ▼            ▼
-        Go Server A   Go Server B
-              \          /
-               \        /
-                 Redis
-                   │
-             shared sessions
-```
-
----
-
-# 6. Session TTL
-
-Sessions stored in Redis have a 15-minute TTL:
-
-```go
-15 * time.Minute
-```
-
-Redis automatically expires the session when the TTL reaches zero.
-
-This provides automatic session expiration.
-
-The TTL can be inspected with:
-
-```bash
-redis-cli
-```
-
-```redis
-TTL sess:<session-id>
-```
-
-Example:
-
-```text
-899
-```
-
----
-
-# 7. HTTP Cookies
-
-The session ID is sent to the browser as a cookie:
-
-```go
-http.SetCookie(w, &http.Cookie{
-    Name:     "sid",
-    Value:    sessionID,
-    HttpOnly: true,
-    Secure:   false,
-    SameSite: http.SameSiteLaxMode,
-    Path:     "/",
-    MaxAge:   15 * 60,
-})
-```
-
-The browser receives:
-
-```http
-Set-Cookie: sid=<session-id>
-```
-
-On subsequent requests it automatically sends:
-
-```http
-Cookie: sid=<session-id>
-```
-
-The server reads it with:
-
-```go
-cookie, err := r.Cookie("sid")
-```
-
----
-
-# 8. Cookie Security Attributes
-
-### HttpOnly
-
-```go
-HttpOnly: true
-```
-
-Prevents JavaScript from reading the cookie.
-
-This helps reduce the impact of some XSS attacks against authentication cookies.
-
----
-
-### Secure
-
-```go
-Secure: true
-```
-
-The browser only sends the cookie over HTTPS.
-
-For local development over:
-
-```text
-http://localhost
-```
-
-the lab uses:
-
-```go
-Secure: false
-```
-
-Production authentication should use HTTPS and `Secure: true`.
-
----
-
-### SameSite
-
-The lab uses:
-
-```go
-SameSite: http.SameSiteLaxMode
-```
-
-This controls when browsers send the cookie in cross-site requests and helps mitigate CSRF-related attacks.
-
----
-
-# 9. Go HTTP Client
-
-The lab also includes a Go client.
-
-A `CookieJar` allows the client to behave similarly to a browser:
-
-```go
-jar, _ := cookiejar.New(nil)
-
-client := &http.Client{
-    Jar: jar,
-}
-```
-
-After login, the client stores:
-
-```text
-sid=<session-id>
-```
-
-and automatically sends it with subsequent requests.
-
-This allows the following flow:
-
-```text
-POST /login
-     │
-     ▼
-Set-Cookie
-     │
-     ▼
-CookieJar
-     │
-     ▼
-GET /profile
-     │
-     ▼
-Cookie automatically attached
-```
-
----
-
-# 10. Browser Client
-
-The server also serves a small HTML client.
-
-The browser can perform:
-
-```text
-Login
-Profile
-Logout
-```
-
-The login request is:
-
-```javascript
-fetch("/login", {
-    method: "POST",
-    headers: {
-        "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-        username: username,
-        password: password
-    })
-});
-```
-
-The browser automatically manages the authentication cookie.
-
-This makes it possible to inspect the authentication flow using browser DevTools.
-
----
-
-# 11. Observing HTTP
-
-Using browser DevTools → Network, the authentication flow can be inspected directly.
-
-### Login
-
-```http
-POST /login
-Content-Type: application/json
-```
-
-Request body:
-
-```json
-{
-    "username": "alice",
-    "password": "secret123"
-}
-```
-
-Response:
-
-```http
-Set-Cookie: sid=<session-id>
-```
-
-### Authenticated request
-
-```http
-GET /profile
-Cookie: sid=<session-id>
-```
-
-This makes the client/server boundary visible instead of hiding it behind a framework.
-
----
-
-# 12. Redis Inspection
-
-Redis can be inspected manually.
-
-List sessions:
-
-```bash
-redis-cli
-```
-
-```redis
-KEYS sess:*
-```
-
-Inspect a session:
-
-```redis
-GET sess:<session-id>
-```
-
-Inspect its TTL:
-
-```redis
-TTL sess:<session-id>
-```
-
-Delete a session manually:
-
-```redis
-DEL sess:<session-id>
-```
-
-Delete everything in the current Redis database:
-
-```redis
-FLUSHDB
-```
-
-`FLUSHDB` should only be used carefully, especially outside a local development environment.
-
----
-
-# 13. Logout
-
-Logout invalidates the session immediately.
-
-The server:
-
-1. Reads the `sid` cookie.
-2. Deletes the corresponding Redis session.
-3. Expires the browser cookie.
-
-Conceptually:
-
-```text
-POST /logout
-      │
-      ▼
-Cookie sid
-      │
-      ▼
-Redis DEL sess:<sid>
-      │
-      ▼
-Expire cookie
-```
-
-After logout:
-
-```text
-GET /profile
-      │
-      ▼
-session not found
-      │
-      ▼
-401 Unauthorized
-```
-
-This is different from TTL expiration:
-
-- Logout invalidates the session immediately.
-- TTL automatically invalidates an inactive session after its lifetime.
-
----
-
-# 14. Cookies vs Web Storage
-
-The lab also explores the difference between:
-
-- Cookies
-- `localStorage`
-- `sessionStorage`
-
-Cookies are automatically included in HTTP requests.
-
-```text
-Browser
-   │
-   │ Cookie: sid=ABC
-   ▼
-Server
-```
-
-`localStorage` and `sessionStorage` are browser-side storage mechanisms and are not automatically sent to the server.
-
-JavaScript can read both:
-
-```javascript
-localStorage.getItem("token")
-sessionStorage.getItem("token")
-```
-
-but an `HttpOnly` cookie cannot be read by JavaScript.
-
-This distinction becomes particularly important when discussing JWT storage.
-
----
-
-# 15. Stateful Authentication
-
-The current implementation is stateful.
-
-The client stores only an identifier:
-
-```text
-sid=ABC
-```
-
-The actual session state lives on the server side:
-
-```text
-ABC → Alice
-```
-
-With Redis:
-
-```text
-ABC → Redis → Alice
-```
-
-The server must therefore maintain session state.
-
----
-
-# 16. Authentication Flow
-
-Complete session-based authentication:
-
-```text
-                 LOGIN
-                   │
-                   ▼
-              username/password
-                   │
-                   ▼
-                bcrypt
-                   │
-              password OK
-                   │
-                   ▼
-             generate SID
-                   │
-                   ▼
-                Redis
-            sess:<sid> → User
-                   │
-                   ▼
-              Set-Cookie
-                   │
-                   ▼
-                CLIENT
-                   │
-                   │ Cookie: sid
-                   ▼
-              GET /profile
-                   │
-                   ▼
-                Redis
-                   │
-                   ▼
-                  User
-                   │
-                   ▼
-               200 OK
-```
-
-Logout:
-
-```text
-POST /logout
-     │
-     ▼
-Cookie sid
-     │
-     ▼
-Redis DEL
-     │
-     ▼
-Expire cookie
-```
-
----
-
-# 17. Running the Lab
-
-## Start Redis
-
-Make sure Redis is running:
-
-```bash
-sudo systemctl start redis-server
-```
-
-Check:
+Start Redis first:
 
 ```bash
 redis-cli ping
@@ -823,115 +460,134 @@ Expected:
 PONG
 ```
 
----
-
-## Start the Go server
-
-From the project root:
+Then run the Go application from the project root:
 
 ```bash
-go run ./server
+go run .
 ```
 
-The server runs on:
+The server is available at:
 
 ```text
 http://localhost:8080
 ```
 
----
+The browser client can be used to test:
 
-## Browser
-
-Open:
-
-```text
-http://localhost:8080
-```
-
-Use the login form and then access the profile.
+- Login
+- Profile
+- Logout
+- Refresh token
 
 ---
 
-## Go Client
+## Inspecting Redis
 
-In another terminal:
+During the lab, Redis can be inspected manually:
 
 ```bash
-go run ./client
+redis-cli
 ```
 
-The client performs the authentication flow programmatically.
+List keys:
+
+```redis
+KEYS *
+```
+
+Useful JWT-branch keys include:
+
+```text
+refresh:<token>
+used_refresh:<token>
+revoked:<jti>
+session:<session-id>
+```
+
+Inspect a key:
+
+```redis
+GET <key>
+```
+
+For a refresh-token Hash:
+
+```redis
+HGETALL refresh:<token>
+```
+
+Check TTL:
+
+```redis
+TTL <key>
+```
+
+For this local lab, `KEYS *` is useful for learning and debugging. In production, prefer `SCAN`.
 
 ---
 
-# 18. Session vs JWT
+## Learning Approach
 
-The next stage of the lab will implement JWT authentication using the same client/server structure.
+The project is intentionally built incrementally.
 
-Current session-based model:
+Instead of starting with a framework that hides authentication internals, the lab implements the mechanisms directly with Go's HTTP stack and Redis.
 
-```text
-Client
-  │
-  │ sid
-  ▼
-Server
-  │
-  ▼
-Redis
-  │
-  ▼
-User
-```
-
-JWT model:
-
-```text
-Client
-  │
-  │ JWT
-  ▼
-Server
-  │
-  ├── verify signature
-  ├── verify expiration
-  └── read claims
-```
-
-The goal is to compare the two approaches through code rather than treating JWT as a purely theoretical concept.
-
----
-
-# Learning Notes
-
-This project is intentionally built incrementally.
-
-The main objective is understanding the mechanics behind authentication:
+The learning path is:
 
 ```text
 Password
    ↓
-Hash
+bcrypt
    ↓
 Authentication
    ↓
-Session
+Stateful sessions
    ↓
-Cookie
+Cookies
    ↓
-Authenticated request
+Redis
    ↓
-Session store
+JWT
+   ↓
+JWT middleware
+   ↓
+JWT revocation
+   ↓
+Refresh tokens
+   ↓
+Refresh token rotation
+   ↓
+Reuse detection
+   ↓
+Session/token-family revocation
 ```
 
-Rather than relying on a framework to hide these details.
+The two branches allow the implementations to be compared directly:
+
+```text
+main
+  │
+  └── Stateful authentication
+          │
+          └── Server-side session state
+
+
+jwt
+  │
+  └── JWT authentication
+          │
+          ├── Stateless access token
+          ├── Redis revocation
+          ├── Refresh tokens
+          ├── Token rotation
+          └── Reuse detection
+```
 
 ---
 
-# Status
+## Current Status
 
-## Session Authentication
+### `main` — Stateful Authentication
 
 - [x] HTTP server
 - [x] HTTP client
@@ -944,21 +600,79 @@ Rather than relying on a framework to hide these details.
 - [x] Redis TTL
 - [x] HTTP cookies
 - [x] HttpOnly
+- [x] Secure
 - [x] SameSite
-- [x] Browser client
+- [x] Browser authentication
 - [x] Authenticated `/profile`
 - [x] Logout
 - [x] Redis inspection
 - [x] CookieJar
 
-## JWT Authentication
+### `jwt` — JWT Authentication
 
-- [ ] JWT generation
-- [ ] JWT claims
-- [ ] JWT signature
-- [ ] JWT verification
-- [ ] JWT expiration
-- [ ] JWT authentication middleware
-- [ ] JWT client
-- [ ] Browser JWT flow
-- [ ] Session vs JWT comparison
+- [x] JWT generation
+- [x] JWT claims
+- [x] JWT signature
+- [x] JWT verification
+- [x] JWT expiration
+- [x] Unique JWT `jti`
+- [x] JWT authentication middleware
+- [x] HttpOnly access-token cookie
+- [x] Redis token revocation
+- [x] Revocation TTL based on JWT expiration
+- [x] Request context for authenticated identity
+- [x] Logout with access-token revocation
+- [x] Opaque refresh tokens
+- [x] Refresh tokens stored in Redis
+- [x] Refresh-token TTL
+- [x] Refresh-token rotation
+- [x] Shared `session_id`
+- [x] Used refresh-token tracking
+- [x] Refresh-token reuse detection
+- [x] Session/token-family revocation
+- [x] Browser refresh flow
+- [x] Redis inspection
+
+---
+
+## Branch Strategy
+
+The branches are intentionally kept separate so each authentication model can be studied independently.
+
+Switch to the original stateful implementation:
+
+```bash
+git checkout main
+```
+
+Switch to the JWT implementation:
+
+```bash
+git checkout jwt
+```
+
+The `main` branch represents the baseline authentication model.
+
+The `jwt` branch represents the extended JWT implementation built on top of the concepts learned in `main`.
+
+---
+
+## Disclaimer
+
+This is a learning lab, not a production-ready authentication system.
+
+Some implementation choices are intentionally simplified to make the authentication mechanics visible and easy to experiment with.
+
+Production systems should additionally consider:
+
+- HTTPS everywhere
+- Secret/key management
+- CSRF protection strategy
+- Secure cookie configuration
+- Redis high availability
+- Atomic refresh-token rotation
+- Rate limiting
+- Audit logging
+- Key rotation
+- Distributed deployment
+- Proper session lifecycle management
