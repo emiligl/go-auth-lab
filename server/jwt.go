@@ -1,6 +1,8 @@
 package main
 
 import (
+    	"crypto/rand"
+    	"encoding/base64"
 	"time"
 	"fmt"
 	"github.com/golang-jwt/jwt/v5"
@@ -8,6 +10,20 @@ import (
 )
 
 var jwtSecret = []byte("super-secret-key")
+
+func GenerateRefreshToken() (string, error) {
+    tokenBytes := make([]byte, 32)
+
+    _, err := rand.Read(tokenBytes)
+    if err != nil {
+        return "", err
+    }
+
+    token := base64.RawURLEncoding.EncodeToString(tokenBytes)
+
+    return token, nil
+}
+
 
 func CreateJWT(user User) (string, error) {
 
@@ -17,7 +33,7 @@ func CreateJWT(user User) (string, error) {
 		"user_id":  user.ID,
 		"user_name":user.Username,
 		"role":     user.Role,
-		"exp": 	    time.Now().Add(10 * time.Minute).Unix(),
+		"exp": 	    time.Now().Add(1 * time.Minute).Unix(),
 		"jti":	    jti,
 	}
 

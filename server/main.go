@@ -70,6 +70,9 @@ func main() {
 		},
 	}
 
+
+	http.HandleFunc("/refresh", refreshHandler)
+
 	http.HandleFunc("/login", loginHandler)	
 
 	http.Handle(
@@ -92,57 +95,319 @@ func main() {
 
 }
 
+
+
+
+func refreshHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    cookie, err := r.Cookie("refresh_token")
+    if err != nil {
+        http.Error(w, "Missing refresh token", http.StatusUnauthorized)
+        return
+    }
+
+    refreshToken := cookie.Value
+    refreshKey := "refresh:" + refreshToken
+
+    // Buscar el refresh token activo
+    refreshData, err := redisClient.HGetAll(
+        r.Context(),
+        refreshKey,
+    ).Result()
+
+    if err != nil {
+        http.Error(w, "Redis error", http.StatusInternalServerError)
+        return
+    }
+
+    // El refresh token no está activo.
+    // Comprobamos si fue utilizado anteriormente.
+    if len(refreshData) == 0 {
+        usedKey := "used_refresh:" + refreshToken
+
+        sessionID, err := redisClient.Get(
+            r.Context(),
+            usedKey,
+        ).Result()
+
+        if err == redis.Nil {
+            http.Error(w, "Invalid refresh token", http.StatusUnauthorized)
+            return
+        }
+
+        if err != nil {
+            http.Error(w, "Redis error", http.StatusInternalServerError)
+            return
+        }
+
+        // El refresh token fue utilizado anteriormente.
+        // Marcamos toda la sesión como revocada.
+        sessionKey := "session:" + sessionID
+
+        err = redisClient.Set(
+            r.Context(),
+            sessionKey,
+            "revoked",
+            7*24*time.Hour,
+        ).Err()
+
+        if err != nil {
+            http.Error(w, "Redis error", http.StatusInternalServerError)
+            return
+        }
+
+        http.Error(w, "Refresh token reuse detected", http.StatusUnauthorized)
+        return
+    }
+
+    userName := refreshData["username"]
+    sessionID := refreshData["session_id"]
+
+    if userName == "" || sessionID == "" {
+        http.Error(w, "Invalid refresh token", http.StatusUnauthorized)
+        return
+    }
+
+    // Comprobar si la sesión completa está revocada
+    sessionKey := "session:" + sessionID
+
+    sessionStatus, err := redisClient.Get(
+        r.Context(),
+        sessionKey,
+    ).Result()
+
+    if err != nil && err != redis.Nil {
+        http.Error(w, "Redis error", http.StatusInternalServerError)
+        return
+    }
+
+    if sessionStatus == "revoked" {
+        http.Error(w, "Session revoked", http.StatusUnauthorized)
+        return
+    }
+
+    // Obtener TTL restante
+    ttl, err := redisClient.TTL(
+        r.Context(),
+        refreshKey,
+    ).Result()
+
+    if err != nil {
+        http.Error(w, "Redis error", http.StatusInternalServerError)
+        return
+    }
+
+    if ttl <= 0 {
+        http.Error(w, "Refresh token expired", http.StatusUnauthorized)
+        return
+    }
+
+    // Marcar el refresh token como utilizado
+    usedKey := "used_refresh:" + refreshToken
+
+    err = redisClient.Set(
+        r.Context(),
+        usedKey,
+        sessionID,
+        ttl,
+    ).Err()
+
+    if err != nil {
+        http.Error(w, "Redis error", http.StatusInternalServerError)
+        return
+    }
+
+    // Eliminar el refresh token antiguo
+    err = redisClient.Del(
+        r.Context(),
+        refreshKey,
+    ).Err()
+
+    if err != nil {
+        http.Error(w, "Redis error", http.StatusInternalServerError)
+        return
+    }
+
+    // Crear nuevo refresh token
+    newRefreshToken, err := GenerateRefreshToken()
+    if err != nil {
+        http.Error(w, "Error creating refresh token", http.StatusInternalServerError)
+        return
+    }
+
+    newRefreshKey := "refresh:" + newRefreshToken
+
+    // Guardar nuevo refresh token
+    err = redisClient.HSet(
+        r.Context(),
+        newRefreshKey,
+        "username", userName,
+        "session_id", sessionID,
+    ).Err()
+
+    if err != nil {
+        http.Error(w, "Redis error", http.StatusInternalServerError)
+        return
+    }
+
+    // Heredar TTL restante
+    err = redisClient.Expire(
+        r.Context(),
+        newRefreshKey,
+        ttl,
+    ).Err()
+
+    if err != nil {
+        http.Error(w, "Redis error", http.StatusInternalServerError)
+        return
+    }
+
+    // Buscar usuario
+    user, exists := users[userName]
+    if !exists {
+        http.Error(w, "User not found", http.StatusUnauthorized)
+        return
+    }
+
+    // Crear nuevo access token
+    tokenString, err := CreateJWT(user)
+    if err != nil {
+        http.Error(w, "Error creating access token", http.StatusInternalServerError)
+        return
+    }
+
+    // Actualizar access token
+    http.SetCookie(w, &http.Cookie{
+        Name:     "access_token",
+        Value:    tokenString,
+        Path:     "/",
+        HttpOnly: true,
+        Secure:   false,
+        SameSite: http.SameSiteLaxMode,
+    })
+
+    // Actualizar refresh token
+    http.SetCookie(w, &http.Cookie{
+        Name:     "refresh_token",
+        Value:    newRefreshToken,
+        Path:     "/",
+        HttpOnly: true,
+        Secure:   false,
+        SameSite: http.SameSiteLaxMode,
+    })
+
+    w.Header().Set("Content-Type", "application/json")
+
+    json.NewEncoder(w).Encode(map[string]string{
+        "message": "Access token refreshed",
+    })
+}
+
+
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "server/index.html")
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+   if r.Method != http.MethodPost {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
 
-	var login LoginRequest
+    var login LoginRequest
 
-	err := json.NewDecoder(r.Body).Decode(&login)
+    err := json.NewDecoder(r.Body).Decode(&login)
+    if err != nil {
+        http.Error(w, "Invalid request", http.StatusBadRequest)
+        return
+    }
 
-	if err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
+    user, exists := users[login.Username]
+    if !exists || !CheckPassword(user.PasswordHash, login.Password) {
+        http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+        return
+    }
 
-	user, exists := users[login.Username]
+    // Access token
+    tokenString, err := CreateJWT(user)
+    if err != nil {
+        http.Error(w, "Error creating token", http.StatusInternalServerError)
+        return
+    }
 
-	if !exists || !CheckPassword(user.PasswordHash, login.Password) {
-		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
-		return
-	}
+    // Refresh token
+    refreshToken, err := GenerateRefreshToken()
+    if err != nil {
+        http.Error(w, "Error creating refresh token", http.StatusInternalServerError)
+        return
+    }
 
-	tokenString, err := CreateJWT(user)
+    // Session ID
+    sessionID, err := GenerateRefreshToken()
+    if err != nil {
+        http.Error(w, "Error creating session", http.StatusInternalServerError)
+        return
+    }
 
-	if err != nil {
-		http.Error(w, "Error creating token", http.StatusInternalServerError)
-		return
-	}
+    // Guardar refresh token en Redis
+    refreshKey := "refresh:" + refreshToken
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     "access_token",
-		Value:    tokenString,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   false,
-		SameSite: http.SameSiteLaxMode,
-	})
+    err = redisClient.HSet(
+        r.Context(),
+        refreshKey,
+        "username", user.Username,
+        "session_id", sessionID,
+    ).Err()
 
-	w.Header().Set("Content-Type", "application/json")
+    if err != nil {
+        http.Error(w, "Redis error", http.StatusInternalServerError)
+        return
+    }
 
-	response := map[string]string{
-		"message": "Login successful",
-	}
+    // TTL del refresh token
+    err = redisClient.Expire(
+        r.Context(),
+        refreshKey,
+        7*24*time.Hour,
+    ).Err()
 
-	json.NewEncoder(w).Encode(response)
+    if err != nil {
+        http.Error(w, "Redis error", http.StatusInternalServerError)
+        return
+    }
+
+    // Cookie access token
+    http.SetCookie(w, &http.Cookie{
+        Name:     "access_token",
+        Value:    tokenString,
+        Path:     "/",
+        HttpOnly: true,
+        Secure:   false,
+        SameSite: http.SameSiteLaxMode,
+    })
+
+    // Cookie refresh token
+    http.SetCookie(w, &http.Cookie{
+        Name:     "refresh_token",
+        Value:    refreshToken,
+        Path:     "/",
+        HttpOnly: true,
+        Secure:   false,
+        SameSite: http.SameSiteLaxMode,
+    })
+
+    w.Header().Set("Content-Type", "application/json")
+
+    json.NewEncoder(w).Encode(map[string]string{
+        "message": "Login successful",
+    })
 }
+
 
 func jwtMiddleware(next http.Handler) http.Handler {
 

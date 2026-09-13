@@ -40,7 +40,9 @@
 
     <button id="logoutButton">Logout</button>
 
-    <h2>Result</h2>
+    <button id="refreshButton">Refresh Token</button>
+
+    <h2>Lab Result</h2>
 
     <pre id="result"></pre>
 
@@ -49,6 +51,8 @@
         const loginForm = document.getElementById("loginForm");
         const profileButton = document.getElementById("profileButton");
         const logoutButton = document.getElementById("logoutButton");
+        const refreshButton = document.getElementById("refreshButton");
+
         const result = document.getElementById("result");
 
 
@@ -109,6 +113,20 @@
             result.textContent = data;
 
 	});
+
+	// Refresh
+	refreshButton.addEventListener("click", async function() {
+
+            const response = await fetch("/refresh", {
+                method: "POST"
+            });
+
+            const data = await response.text();
+
+            result.textContent = data;
+
+        });
+
     </script>
 
 </body>
